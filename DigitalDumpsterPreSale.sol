@@ -4,9 +4,10 @@ pragma solidity ^0.8.20;
 // WEBSITE: DIGITALDUMPSTER.XYZ
 // TWITTER: @TRASHCOINETH
 
-import "ReentrancyGuard.sol";
-import "SafeMath.sol";
-import "IERC20.sol";
+import "./MerkleProof.sol";
+import "./ReentrancyGuard.sol";
+import "./SafeMath.sol";
+import "./IERC20.sol";
 
 abstract contract Context {
   function _msgSender() internal view virtual returns (address payable) {
@@ -46,6 +47,11 @@ contract Ownable is Context {
   }
 }
 
+struct SaleNumbers {
+  uint256 ico;
+  uint256 privateRound;
+}
+
 contract DigitalDumpsterPreSale is ReentrancyGuard, Ownable {
   using SafeMath for uint256;
 
@@ -59,14 +65,21 @@ contract DigitalDumpsterPreSale is ReentrancyGuard, Ownable {
   uint256 public startDate;
   uint256 public startICODate;
   uint256 public _weiRaised;
-  uint256 public minPurchase = 0.05 ether;
-  uint256 public maxPurchase = 0.5 ether;
+
+  SaleNumbers public minPurchase = SaleNumbers({ ico: 0.05 ether, privateRound: 0.05 ether });
+  SaleNumbers public maxPurchase = SaleNumbers({ ico: 0.5 ether, privateRound: 0.5 ether });
+
   uint256 public softCap = 30 ether;
-  uint256 public hardCap = 300 ether;
+  SaleNumbers public hardCap = SaleNumbers({ ico: 300 ether, privateRound: 300 ether });
+
   uint256 public availableTokensICO = 14000000 * (10 ** 18);
   uint256 public refundStartDate;
   uint256 public endICO;
   bool public startRefund = false;
+
+  bool public privateRoundActive;
+  bytes32 public merkleRoot;
+
   mapping(address => bool) public airdropRecipients;
   address[] public airdropAddresses;
   uint256 public numRecipients;
@@ -91,6 +104,12 @@ contract DigitalDumpsterPreSale is ReentrancyGuard, Ownable {
     _;
   }
 
+  modifier validateInputs(address beneficiary, uint256 weiAmount) {
+    require(beneficiary != address(0), "Crowdsale: beneficiary is the zero address");
+    require(weiAmount != 0, "Crowdsale: weiAmount is 0");
+    _;
+  }
+
   constructor(address payable wallet, address tokenAddress, uint256 tokenDecimals) {
     require(wallet != address(0), "Pre-Sale: wallet is the zero address");
     require(tokenAddress != address(0), "Pre-Sale: token is the zero address");
@@ -101,12 +120,8 @@ contract DigitalDumpsterPreSale is ReentrancyGuard, Ownable {
   }
 
   receive() external payable {
-    if (endICO > 0 && block.timestamp < endICO) {
-      buyTokens(_msgSender());
-    } else {
-      endICO = 0;
-      revert("Pre-Sale is closed");
-    }
+    bytes32[] memory emptyProof;
+    buyTokens(_msgSender(), emptyProof);
   }
 
   function startICO(uint _startDate, uint _endDate) external onlyOwner icoNotActive icoNotStarted {
@@ -131,23 +146,33 @@ contract DigitalDumpsterPreSale is ReentrancyGuard, Ownable {
     }
   }
 
-  function buyTokens(address beneficiary) public payable nonReentrant icoActive {
-    uint256 weiAmount = msg.value;
-    _preValidatePurchase(beneficiary, weiAmount);
+  function buyTokens(address beneficiary, bytes32[] memory proof) public payable nonReentrant validateInputs(beneficiary, msg.value) {
+    if (privateRoundActive) {
+      require((_weiRaised.add(msg.value)) <= hardCap.privateRound, "Private round hard cap reached");
+      require(msg.value >= minPurchase.privateRound, "have to send at least: minPurchase");
+      require(_contributions[beneficiary].add(msg.value) <= maxPurchase.privateRound, "can't buy more than: maxPurchase");
+
+      bool verify = MerkleProof.verify(proof, merkleRoot, keccak256(abi.encodePacked(_msgSender())));
+      require(verify, "Not whitelisted");
+
+      executePurchase(beneficiary, msg.value);
+    } else if (isICOActive()) {
+      require((_weiRaised.add(msg.value)) <= hardCap.ico, "ICO hard cap reached");
+      require(msg.value >= minPurchase.ico, "have to send at least: minPurchase");
+      require(_contributions[beneficiary].add(msg.value) <= maxPurchase.ico, "can't buy more than: maxPurchase");
+
+      executePurchase(beneficiary, msg.value);
+    } else {
+      revert("Pre-Sale is closed");
+    }
+  }
+
+  function executePurchase(address beneficiary, uint256 weiAmount) internal {
     uint256 tokens = _getTokenAmount(weiAmount);
     _weiRaised = _weiRaised.add(weiAmount);
     availableTokensICO = availableTokensICO.sub(tokens);
     _contributions[beneficiary] = _contributions[beneficiary].add(weiAmount);
     emit TokensPurchased(_msgSender(), beneficiary, weiAmount, tokens);
-  }
-
-  function _preValidatePurchase(address beneficiary, uint256 weiAmount) internal view {
-    require(beneficiary != address(0), "Crowdsale: beneficiary is the zero address");
-    require(weiAmount != 0, "Crowdsale: weiAmount is 0");
-    require(weiAmount >= minPurchase, "have to send at least: minPurchase");
-    require(_contributions[beneficiary].add(weiAmount) <= maxPurchase, "can't buy more than: maxPurchase");
-    require((_weiRaised.add(weiAmount)) <= hardCap, "Hard Cap reached");
-    require(block.timestamp >= startDate && block.timestamp <= endICO, "ICO is not active");
   }
 
   function claimTokens() public nonReentrant icoNotActive returns (bool) {
@@ -207,6 +232,15 @@ contract DigitalDumpsterPreSale is ReentrancyGuard, Ownable {
     return _contributions[addr];
   }
 
+  function setPrivateRoundActive(bool state) public onlyOwner {
+    require(privateRoundActive != state, "Private round is already in that state");
+    privateRoundActive = state;
+  }
+
+  function setMerkleRoot(bytes32 _root) external onlyOwner {
+    merkleRoot = _root;
+  }
+
   function setAvailableTokens(uint256 amount) public onlyOwner icoNotActive {
     availableTokensICO = amount;
   }
@@ -219,20 +253,32 @@ contract DigitalDumpsterPreSale is ReentrancyGuard, Ownable {
     _wallet = newWallet;
   }
 
-  function setHardCap(uint256 value) external onlyOwner {
-    hardCap = value;
+  function setHardCapPrivate(uint256 value) external onlyOwner {
+    hardCap.privateRound = value;
+  }
+
+  function setHardCapICO(uint256 value) external onlyOwner {
+    hardCap.ico = value;
   }
 
   function setSoftCap(uint256 value) external onlyOwner {
     softCap = value;
   }
 
-  function setMaxPurchase(uint256 value) external onlyOwner {
-    maxPurchase = value;
+  function setMaxPurchasePrivate(uint256 value) external onlyOwner {
+    maxPurchase.privateRound = value;
   }
 
-  function setMinPurchase(uint256 value) external onlyOwner {
-    minPurchase = value;
+  function setMinPurchasePrivateO(uint256 value) external onlyOwner {
+    minPurchase.privateRound = value;
+  }
+
+  function setMaxPurchaseICO(uint256 value) external onlyOwner {
+    maxPurchase.ico = value;
+  }
+
+  function setMinPurchaseICO(uint256 value) external onlyOwner {
+    minPurchase.ico = value;
   }
 
   function isICOActive() public view returns (bool) {
